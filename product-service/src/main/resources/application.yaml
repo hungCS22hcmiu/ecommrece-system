@@ -4,7 +4,7 @@ spring:
   main:
     # Defer all bean creation (DataSource, Flyway, Redis) until first use.
     # Remove this once the database is available in docker-compose.
-    lazy-initialization: true
+    lazy-initialization: false
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/ecommerce_products
     username: ${DB_USER:postgres}

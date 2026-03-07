@@ -24,20 +24,23 @@ cp .env.example .env
 # Edit .env with actual values
 ```
 
-Start infrastructure (Postgres, Redis, Kafka, Zookeeper):
+Start only what the current task needs (prefer minimal):
 ```bash
-docker compose up -d postgres redis zookeeper kafka
+# Core infrastructure (needed by almost everything)
+docker compose up -d postgres redis
+
+# Add Kafka only when working on payment/order Kafka flows
+docker compose up -d zookeeper kafka
+
+# Start a specific service
+docker compose up -d user-service
+
+# Build images (first time or after code changes)
+docker compose build             # all services
+docker compose build user-service  # single service
 ```
 
-Start all services:
-```bash
-docker compose up -d
-```
-
-Initialize databases (run once, auto-applied via Docker init script):
-```bash
-# Runs automatically: script/init-databases.sql creates all 5 logical databases
-```
+Databases are initialized automatically on first Postgres start via `script/init-databases.sql`.
 
 ## Go Services (user-service, cart-service, payment-service)
 
@@ -97,7 +100,7 @@ Java version: 21. Spring Boot: 3.5. Uses Flyway for DB migrations, Lombok for bo
 
 ### Communication
 - **Synchronous REST**: Cart Service calls Product Service (`PRODUCT_SERVICE_URL`) for price/stock validation.
-- **Async Kafka (Choreography Saga)**: `orders.created` → Payment Service processes → emits `payments.completed` or `payments.failed` → Order Service updates status.
+- **Async Kafka (Choreography Saga)**: `orders.created` → Payment Service processes → emits `payments.completed` or `payments.failed` → Order Service updates status. Inside Docker, services connect to Kafka at `kafka:29092` (internal listener), not `kafka:9092` (host port).
 
 ### Databases
 Single PostgreSQL instance with 5 logical databases (one per service). Cross-DB references are enforced at the application level, not by FK constraints.
@@ -139,12 +142,11 @@ All responses use a consistent shape (defined in `api/openapi.yaml`):
 ```
 
 ### Health Probes
-Every service exposes:
-- `GET /health/live` — liveness (process alive, no dependency checks)
-- `GET /health/ready` — readiness (checks Postgres + Redis connectivity)
+- Go services: `GET /health/live` + `GET /health/ready` (checks Postgres + Redis)
+- Java services: `GET /health/live` only (no `/ready` endpoint yet)
 
 ## Key Files
-- `docker-compose.yml` — infrastructure only (Postgres, Redis, Kafka, Zookeeper); services run locally or are added separately
+- `docker-compose.yml` — full stack (infrastructure + all 5 service containers); each service has a `Dockerfile` in its root directory
 - `script/init-databases.sql` — creates all 5 databases and schemas with indexes
 - `api/openapi.yaml` — full REST API contract
 - `docs/adr/locking-strategy.md` — detailed rationale for per-service concurrency decisions

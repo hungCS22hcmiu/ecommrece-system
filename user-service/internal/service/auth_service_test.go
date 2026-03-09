@@ -2,19 +2,25 @@ package service_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"testing"
+	"time"
 
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
 	"github.com/hungCS22hcmiu/ecommrece-system/user-service/internal/dto"
 	"github.com/hungCS22hcmiu/ecommrece-system/user-service/internal/model"
 	"github.com/hungCS22hcmiu/ecommrece-system/user-service/internal/repository"
 	"github.com/hungCS22hcmiu/ecommrece-system/user-service/internal/service"
+	"github.com/hungCS22hcmiu/ecommrece-system/user-service/pkg/password"
 )
 
 // ─── Mock user repository ─────────────────────────────────────────────────────
@@ -133,4 +139,362 @@ func TestRegister_RepoCreateError_ReturnsError(t *testing.T) {
 	_, err := svc.Register(context.Background(), validRegisterRequest())
 
 	assert.Error(t, err)
+}
+
+// ─── Mock auth-token repository ───────────────────────────────────────────────
+
+type mockAuthTokenRepo struct {
+	mock.Mock
+}
+
+func (m *mockAuthTokenRepo) Create(ctx context.Context, token *model.AuthToken) error {
+	args := m.Called(ctx, token)
+	return args.Error(0)
+}
+
+func (m *mockAuthTokenRepo) FindByHash(ctx context.Context, hash string) (*model.AuthToken, error) {
+	args := m.Called(ctx, hash)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.AuthToken), args.Error(1)
+}
+
+func (m *mockAuthTokenRepo) RevokeByUserID(ctx context.Context, userID uuid.UUID) error {
+	args := m.Called(ctx, userID)
+	return args.Error(0)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// generateTestRSAKey generates a 2048-bit RSA key pair for use in tests.
+func generateTestRSAKey(t *testing.T) (*rsa.PrivateKey, *rsa.PublicKey) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	return key, &key.PublicKey
+}
+
+// newMockDB creates a *gorm.DB backed by go-sqlmock so tests can assert
+// transaction lifecycle (BEGIN / COMMIT / ROLLBACK) without a real database.
+func newMockDB(t *testing.T) (*gorm.DB, sqlmock.Sqlmock) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	require.NoError(t, err)
+	return db, mock
+}
+
+func validLoginRequest() dto.LoginRequest {
+	return dto.LoginRequest{Email: "john@example.com", Password: "secret123"}
+}
+
+// bcryptHash is a thin wrapper so tests can produce real bcrypt hashes without
+// importing the internal service package (which would cause a cycle).
+func bcryptHash(plain string) (string, error) {
+	return password.Hash(plain)
+}
+
+// ─── Login tests ──────────────────────────────────────────────────────────────
+
+func TestLogin_Success(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	userID := uuid.New()
+	user := &model.User{
+		Email:    "john@example.com",
+		Role:     "customer",
+		IsLocked: false,
+		Profile:  &model.UserProfile{FirstName: "John", LastName: "Doe"},
+	}
+	user.ID = userID
+
+	// bcrypt hash of "secret123"
+	hash, err := bcryptHash("secret123")
+	require.NoError(t, err)
+	user.PasswordHash = hash
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectCommit()
+
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(user, nil)
+	userRepo.On("UpdateLoginAttempts", mock.Anything, mock.Anything, userID, 0, false).
+		Return(nil)
+	tokenRepo.On("Create", mock.Anything, mock.AnythingOfType("*model.AuthToken")).
+		Return(nil)
+
+	resp, err := svc.Login(context.Background(), validLoginRequest())
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.NotEmpty(t, resp.AccessToken)
+	assert.NotEmpty(t, resp.RefreshToken)
+	assert.Equal(t, "john@example.com", resp.User.Email)
+	assert.Equal(t, "customer", resp.User.Role)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+	userRepo.AssertExpectations(t)
+	tokenRepo.AssertExpectations(t)
+}
+
+func TestLogin_UserNotFound_ReturnsErrInvalidCredentials(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectRollback()
+
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(nil, repository.ErrNotFound)
+
+	_, err := svc.Login(context.Background(), validLoginRequest())
+
+	assert.ErrorIs(t, err, service.ErrInvalidCredentials)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+}
+
+func TestLogin_AccountLocked_ReturnsErrAccountLocked(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	userID := uuid.New()
+	user := &model.User{Email: "john@example.com", IsLocked: true}
+	user.ID = userID
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectRollback()
+
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(user, nil)
+
+	_, err := svc.Login(context.Background(), validLoginRequest())
+
+	assert.ErrorIs(t, err, service.ErrAccountLocked)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+}
+
+func TestLogin_WrongPassword_ReturnsErrInvalidCredentials(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	userID := uuid.New()
+	// password hash for "correct-password", not "secret123"
+	hash, err := bcryptHash("correct-password")
+	require.NoError(t, err)
+	user := &model.User{
+		Email:               "john@example.com",
+		PasswordHash:        hash,
+		FailedLoginAttempts: 0,
+		IsLocked:            false,
+	}
+	user.ID = userID
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectRollback()
+
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(user, nil)
+	// wrong password → attempts=1, locked=false
+	userRepo.On("UpdateLoginAttempts", mock.Anything, mock.Anything, userID, 1, false).
+		Return(nil)
+
+	_, err = svc.Login(context.Background(), validLoginRequest())
+
+	assert.ErrorIs(t, err, service.ErrInvalidCredentials)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+	userRepo.AssertExpectations(t)
+}
+
+func TestLogin_WrongPassword_AtMaxAttempts_ReturnsErrAccountLocked(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	userID := uuid.New()
+	hash, err := bcryptHash("correct-password")
+	require.NoError(t, err)
+	// already at 4 failed attempts; one more will hit the limit of 5
+	user := &model.User{
+		Email:               "john@example.com",
+		PasswordHash:        hash,
+		FailedLoginAttempts: 4,
+		IsLocked:            false,
+	}
+	user.ID = userID
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectRollback()
+
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(user, nil)
+	// attempts=5, locked=true
+	userRepo.On("UpdateLoginAttempts", mock.Anything, mock.Anything, userID, 5, true).
+		Return(nil)
+
+	_, err = svc.Login(context.Background(), validLoginRequest())
+
+	assert.ErrorIs(t, err, service.ErrAccountLocked)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+	userRepo.AssertExpectations(t)
+}
+
+func TestLogin_UpdateAttemptsError_ReturnsError(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	userID := uuid.New()
+	hash, err := bcryptHash("secret123")
+	require.NoError(t, err)
+	user := &model.User{Email: "john@example.com", PasswordHash: hash, IsLocked: false}
+	user.ID = userID
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectRollback()
+
+	dbErr := errors.New("db update failed")
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(user, nil)
+	userRepo.On("UpdateLoginAttempts", mock.Anything, mock.Anything, userID, 0, false).
+		Return(dbErr)
+
+	_, err = svc.Login(context.Background(), validLoginRequest())
+
+	assert.Error(t, err)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+}
+
+func TestLogin_CreateAuthTokenError_ReturnsError(t *testing.T) {
+	db, dbMock := newMockDB(t)
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, db, privKey, pubKey)
+
+	userID := uuid.New()
+	hash, err := bcryptHash("secret123")
+	require.NoError(t, err)
+	user := &model.User{Email: "john@example.com", PasswordHash: hash, IsLocked: false, Role: "customer"}
+	user.ID = userID
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectRollback()
+
+	dbErr := errors.New("token insert failed")
+	userRepo.On("FindByEmailForUpdate", mock.Anything, mock.Anything, "john@example.com").
+		Return(user, nil)
+	userRepo.On("UpdateLoginAttempts", mock.Anything, mock.Anything, userID, 0, false).
+		Return(nil)
+	tokenRepo.On("Create", mock.Anything, mock.AnythingOfType("*model.AuthToken")).
+		Return(dbErr)
+
+	_, err = svc.Login(context.Background(), validLoginRequest())
+
+	assert.Error(t, err)
+	require.NoError(t, dbMock.ExpectationsWereMet())
+}
+
+// ─── Refresh tests ────────────────────────────────────────────────────────────
+
+func TestRefresh_Success(t *testing.T) {
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, nil, privKey, pubKey)
+
+	userID := uuid.New()
+	rawToken := "some-raw-refresh-token"
+	authToken := &model.AuthToken{
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	user := &model.User{Email: "john@example.com", Role: "customer"}
+	user.ID = userID
+
+	tokenRepo.On("FindByHash", mock.Anything, mock.AnythingOfType("string")).
+		Return(authToken, nil)
+	userRepo.On("FindByID", mock.Anything, userID).
+		Return(user, nil)
+
+	resp, err := svc.Refresh(context.Background(), rawToken)
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.NotEmpty(t, resp.AccessToken)
+	assert.Equal(t, "john@example.com", resp.User.Email)
+	tokenRepo.AssertExpectations(t)
+	userRepo.AssertExpectations(t)
+}
+
+func TestRefresh_TokenNotFound_ReturnsErrInvalidToken(t *testing.T) {
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, nil, privKey, pubKey)
+
+	tokenRepo.On("FindByHash", mock.Anything, mock.AnythingOfType("string")).
+		Return(nil, repository.ErrTokenNotFound)
+
+	_, err := svc.Refresh(context.Background(), "bad-token")
+
+	assert.ErrorIs(t, err, service.ErrInvalidToken)
+	userRepo.AssertNotCalled(t, "FindByID")
+}
+
+func TestRefresh_DBError_ReturnsError(t *testing.T) {
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, nil, privKey, pubKey)
+
+	dbErr := errors.New("connection lost")
+	tokenRepo.On("FindByHash", mock.Anything, mock.AnythingOfType("string")).
+		Return(nil, dbErr)
+
+	_, err := svc.Refresh(context.Background(), "some-token")
+
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, dbErr)
+}
+
+func TestRefresh_UserNotFound_ReturnsErrInvalidToken(t *testing.T) {
+	userRepo := new(mockUserRepo)
+	tokenRepo := new(mockAuthTokenRepo)
+	privKey, pubKey := generateTestRSAKey(t)
+	svc := service.NewAuthService(userRepo, tokenRepo, nil, privKey, pubKey)
+
+	userID := uuid.New()
+	authToken := &model.AuthToken{
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+
+	tokenRepo.On("FindByHash", mock.Anything, mock.AnythingOfType("string")).
+		Return(authToken, nil)
+	userRepo.On("FindByID", mock.Anything, userID).
+		Return(nil, repository.ErrNotFound)
+
+	_, err := svc.Refresh(context.Background(), "some-token")
+
+	assert.ErrorIs(t, err, service.ErrInvalidToken)
 }

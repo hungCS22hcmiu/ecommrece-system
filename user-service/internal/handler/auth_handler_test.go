@@ -299,3 +299,81 @@ func TestRefreshHandler_InvalidToken_Returns401(t *testing.T) {
 	errDetail := body["error"].(map[string]any)
 	assert.Equal(t, "INVALID_TOKEN", errDetail["code"])
 }
+
+func TestRefreshHandler_ValidationError_Returns400(t *testing.T) {
+	svc := new(mockAuthService)
+	router := newRouter(svc)
+
+	// missing refresh_token field
+	w := postJSON(router, "/api/v1/auth/refresh", map[string]any{})
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	body := parseBody(t, w)
+	assert.False(t, body["success"].(bool))
+	errDetail := body["error"].(map[string]any)
+	assert.Equal(t, "VALIDATION_ERROR", errDetail["code"])
+	svc.AssertNotCalled(t, "Refresh")
+}
+
+func TestRefreshHandler_InvalidJSON_Returns400(t *testing.T) {
+	svc := new(mockAuthService)
+	router := newRouter(svc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", bytes.NewBufferString("not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	body := parseBody(t, w)
+	assert.False(t, body["success"].(bool))
+	errDetail := body["error"].(map[string]any)
+	assert.Equal(t, "INVALID_BODY", errDetail["code"])
+	svc.AssertNotCalled(t, "Refresh")
+}
+
+func TestRefreshHandler_ServiceError_Returns500(t *testing.T) {
+	svc := new(mockAuthService)
+	router := newRouter(svc)
+
+	svc.On("Refresh", mock.Anything, "some-token").Return(nil, assert.AnError)
+
+	w := postJSON(router, "/api/v1/auth/refresh", map[string]any{"refresh_token": "some-token"})
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	body := parseBody(t, w)
+	assert.False(t, body["success"].(bool))
+	svc.AssertExpectations(t)
+}
+
+func TestLoginHandler_InvalidJSON_Returns400(t *testing.T) {
+	svc := new(mockAuthService)
+	router := newRouter(svc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString("not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	body := parseBody(t, w)
+	assert.False(t, body["success"].(bool))
+	errDetail := body["error"].(map[string]any)
+	assert.Equal(t, "INVALID_BODY", errDetail["code"])
+	svc.AssertNotCalled(t, "Login")
+}
+
+func TestLoginHandler_ServiceError_Returns500(t *testing.T) {
+	svc := new(mockAuthService)
+	router := newRouter(svc)
+
+	req := dto.LoginRequest{Email: "john@example.com", Password: "secret123"}
+	svc.On("Login", mock.Anything, req).Return(nil, assert.AnError)
+
+	w := postJSON(router, "/api/v1/auth/login", req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	body := parseBody(t, w)
+	assert.False(t, body["success"].(bool))
+	svc.AssertExpectations(t)
+}
